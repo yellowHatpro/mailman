@@ -1,0 +1,26 @@
+#[derive(Debug, Clone)]
+pub struct MessageSummary {
+    pub id: String,
+    pub from: String,
+    pub subject: String,
+    pub received_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageDetail {
+    pub id: String,
+    pub from: String,
+    pub to: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    pub received_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredToken {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_in_seconds: Option<u64>,
+    pub scopes: Vec<String>,
+    pub token_type: Option<String>,
+}
