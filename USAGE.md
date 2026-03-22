@@ -6,6 +6,7 @@
 
 Right now, these commands work:
 
+- `mailman` opens the inbox terminal UI
 - `init` creates your config file
 - `auth` signs you into Google in the browser
 - `inbox` lists recent inbox messages
@@ -84,6 +85,22 @@ The inbox output includes:
 - subject
 - sender
 
+## Launch the TUI
+
+Open the inbox viewer:
+
+```bash
+cargo run
+```
+
+TUI controls:
+
+- `j` or Down Arrow moves down
+- `k` or Up Arrow moves up
+- `g` jumps to the top
+- `G` jumps to the bottom
+- `q` or `Esc` quits
+
 ## Current Limitations
 
 - `read` is not connected to the real Gmail API yet.
@@ -116,6 +133,8 @@ If `inbox` says no OAuth token was found, run:
 ```bash
 cargo run -- auth
 ```
+
+If `mailman` exits immediately with an auth-related error, authenticate first and then launch it again.
 
 ## Security Notes
 

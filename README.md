@@ -11,6 +11,7 @@
 
 The scaffold includes commands for:
 
+- default launch to open the inbox terminal UI
 - `init` to create a config file
 - `auth` to complete the OAuth flow and store tokens
 - `inbox` to list recent messages

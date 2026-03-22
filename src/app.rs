@@ -3,9 +3,46 @@ use anyhow::Result;
 use crate::cli::{Cli, Commands};
 use crate::config::AppConfig;
 use crate::gmail::client::{GmailClient, StubGmailClient};
+use crate::ui::inbox::{InboxEvent, InboxTui};
+use tokio::sync::mpsc;
 
 pub async fn run(cli: Cli) -> Result<()> {
-    match cli.command {
+    if cli.command.is_none() {
+        let config = AppConfig::load_or_init()?;
+        let client = StubGmailClient::from_config(&config);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let limit = 25;
+            match client.list_inbox_ids(limit).await {
+                Ok(ids) => {
+                    let total = ids.len();
+                    let _ = tx.send(InboxEvent::Started { total });
+
+                    for id in ids {
+                        match client.fetch_message_summary(&id).await {
+                            Ok(message) => {
+                                let _ = tx.send(InboxEvent::MessageLoaded(message));
+                            }
+                            Err(error) => {
+                                let _ = tx.send(InboxEvent::Failed(error.to_string()));
+                                return;
+                            }
+                        }
+                    }
+
+                    let _ = tx.send(InboxEvent::Finished);
+                }
+                Err(error) => {
+                    let _ = tx.send(InboxEvent::Failed(error.to_string()));
+                }
+            }
+        });
+
+        InboxTui::new(rx).run()?;
+        return Ok(());
+    }
+
+    match cli.command.expect("checked above") {
         Commands::Init => {
             let path = AppConfig::init_default_config()?;
             println!("Created config at {}", path.display());

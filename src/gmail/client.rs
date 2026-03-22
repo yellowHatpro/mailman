@@ -31,6 +31,7 @@ pub trait GmailClient {
     async fn send_message(&self, to: &[String], subject: &str, body: &str) -> Result<()>;
 }
 
+#[derive(Clone)]
 pub struct StubGmailClient {
     config: AppConfig,
 }
@@ -50,6 +51,45 @@ impl StubGmailClient {
         }
 
         Ok(())
+    }
+
+    pub async fn list_inbox_ids(&self, limit: usize) -> Result<Vec<String>> {
+        self.ensure_configured()?;
+        let capped = limit.min(50);
+        let client = self.authorized_http_client().await?;
+        let token = require_token(self)?;
+
+        match self
+            .fetch_inbox_message_ids(&client, &token.access_token, capped)
+            .await
+        {
+            Ok(ids) => Ok(ids),
+            Err(error) if is_unauthorized(&error) => {
+                let refreshed = self.refresh_access_token(token).await?;
+                self.fetch_inbox_message_ids(&client, &refreshed.access_token, capped)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn fetch_message_summary(&self, id: &str) -> Result<MessageSummary> {
+        self.ensure_configured()?;
+        let client = self.authorized_http_client().await?;
+        let token = require_token(self)?;
+
+        match self
+            .fetch_message_summary_with_token(&client, &token.access_token, id)
+            .await
+        {
+            Ok(message) => Ok(message),
+            Err(error) if is_unauthorized(&error) => {
+                let refreshed = self.refresh_access_token(token).await?;
+                self.fetch_message_summary_with_token(&client, &refreshed.access_token, id)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn oauth_client(
@@ -108,51 +148,48 @@ impl StubGmailClient {
         Ok(Some(token))
     }
 
-    async fn authorized_http_client(&self) -> Result<(HttpClient, String)> {
-        let token = require_token(self)?;
-        let access_token = self.ensure_access_token(token).await?;
+    async fn authorized_http_client(&self) -> Result<HttpClient> {
         let client = HttpClient::builder()
             .build()
             .context("failed to build HTTP client")?;
 
-        Ok((client, access_token))
+        Ok(client)
     }
 
-    async fn ensure_access_token(&self, token: StoredToken) -> Result<String> {
-        if let Some(refresh_token) = token.refresh_token.clone() {
-            let oauth_client = self.oauth_client()?;
-            let http_client = HttpClient::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .context("failed to build OAuth HTTP client")?;
+    async fn refresh_access_token(&self, token: StoredToken) -> Result<StoredToken> {
+        let refresh_token = token.refresh_token.clone().ok_or_else(|| {
+            anyhow!("saved OAuth token has no refresh token; run `mailman auth` again")
+        })?;
 
-            let refreshed = oauth_client
-                .exchange_refresh_token(&RefreshToken::new(refresh_token))
-                .request_async(&http_client)
-                .await
-                .context("failed to refresh OAuth access token")?;
+        let oauth_client = self.oauth_client()?;
+        let http_client = HttpClient::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("failed to build OAuth HTTP client")?;
 
-            let updated = StoredToken {
-                access_token: refreshed.access_token().secret().to_string(),
-                refresh_token: refreshed
-                    .refresh_token()
-                    .map(RefreshToken::secret)
-                    .map(ToString::to_string)
-                    .or(token.refresh_token),
-                expires_in_seconds: refreshed.expires_in().map(|duration| duration.as_secs()),
-                scopes: refreshed
-                    .scopes()
-                    .map(|items| items.iter().map(|scope| scope.to_string()).collect())
-                    .unwrap_or(token.scopes),
-                token_type: Some(format!("{:?}", refreshed.token_type())),
-            };
+        let refreshed = oauth_client
+            .exchange_refresh_token(&RefreshToken::new(refresh_token))
+            .request_async(&http_client)
+            .await
+            .context("failed to refresh OAuth access token")?;
 
-            let access_token = updated.access_token.clone();
-            self.save_token(&updated)?;
-            return Ok(access_token);
-        }
+        let updated = StoredToken {
+            access_token: refreshed.access_token().secret().to_string(),
+            refresh_token: refreshed
+                .refresh_token()
+                .map(RefreshToken::secret)
+                .map(ToString::to_string)
+                .or(token.refresh_token),
+            expires_in_seconds: refreshed.expires_in().map(|duration| duration.as_secs()),
+            scopes: refreshed
+                .scopes()
+                .map(|items| items.iter().map(|scope| scope.to_string()).collect())
+                .unwrap_or(token.scopes),
+            token_type: Some(format!("{:?}", refreshed.token_type())),
+        };
 
-        Ok(token.access_token)
+        self.save_token(&updated)?;
+        Ok(updated)
     }
 }
 
@@ -236,54 +273,21 @@ impl GmailClient for StubGmailClient {
     async fn list_inbox(&self, limit: usize) -> Result<Vec<MessageSummary>> {
         self.ensure_configured()?;
         let capped = limit.min(50);
-        let (client, access_token) = self.authorized_http_client().await?;
-        let max_results = capped.to_string();
+        let client = self.authorized_http_client().await?;
+        let token = require_token(self)?;
 
-        let list_response = client
-            .get(format!("{GMAIL_API_BASE}/users/me/messages"))
-            .query(&[("labelIds", "INBOX"), ("maxResults", max_results.as_str())])
-            .bearer_auth(&access_token)
-            .send()
+        match self
+            .fetch_inbox_messages(&client, &token.access_token, capped)
             .await
-            .context("failed to query Gmail inbox")?
-            .error_for_status()
-            .context("Gmail inbox query failed")?
-            .json::<ListMessagesResponse>()
-            .await
-            .context("failed to decode Gmail inbox response")?;
-
-        let mut messages = Vec::new();
-        for item in list_response.messages.unwrap_or_default() {
-            let detail = client
-                .get(format!("{GMAIL_API_BASE}/users/me/messages/{}", item.id))
-                .query(&[
-                    ("format", "metadata"),
-                    ("metadataHeaders", "From"),
-                    ("metadataHeaders", "Subject"),
-                    ("metadataHeaders", "Date"),
-                ])
-                .bearer_auth(&access_token)
-                .send()
-                .await
-                .with_context(|| format!("failed to fetch Gmail message {}", item.id))?
-                .error_for_status()
-                .with_context(|| format!("Gmail returned an error for message {}", item.id))?
-                .json::<GmailMessageResponse>()
-                .await
-                .with_context(|| format!("failed to decode Gmail message {}", item.id))?;
-
-            messages.push(MessageSummary {
-                id: item.id,
-                from: header_value(&detail.payload, "From")
-                    .unwrap_or_else(|| "(unknown sender)".to_string()),
-                subject: header_value(&detail.payload, "Subject")
-                    .unwrap_or_else(|| "(no subject)".to_string()),
-                received_at: header_value(&detail.payload, "Date")
-                    .unwrap_or_else(|| "(unknown date)".to_string()),
-            });
+        {
+            Ok(messages) => Ok(messages),
+            Err(error) if is_unauthorized(&error) => {
+                let refreshed = self.refresh_access_token(token).await?;
+                self.fetch_inbox_messages(&client, &refreshed.access_token, capped)
+                    .await
+            }
+            Err(error) => Err(error),
         }
-
-        Ok(messages)
     }
 
     async fn read_message(&self, id: &str) -> Result<MessageDetail> {
@@ -319,10 +323,103 @@ impl GmailClient for StubGmailClient {
     }
 }
 
+impl StubGmailClient {
+    async fn fetch_inbox_messages(
+        &self,
+        client: &HttpClient,
+        access_token: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageSummary>> {
+        let message_ids = self
+            .fetch_inbox_message_ids(client, access_token, limit)
+            .await?;
+        let mut messages = Vec::new();
+        for id in message_ids {
+            messages.push(
+                self.fetch_message_summary_with_token(client, access_token, &id)
+                    .await?,
+            );
+        }
+
+        Ok(messages)
+    }
+
+    async fn fetch_inbox_message_ids(
+        &self,
+        client: &HttpClient,
+        access_token: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let max_results = limit.to_string();
+
+        let list_response = client
+            .get(format!("{GMAIL_API_BASE}/users/me/messages"))
+            .query(&[("labelIds", "INBOX"), ("maxResults", max_results.as_str())])
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .context("failed to query Gmail inbox")?
+            .error_for_status()
+            .context("Gmail inbox query failed")?
+            .json::<ListMessagesResponse>()
+            .await
+            .context("failed to decode Gmail inbox response")?;
+
+        Ok(list_response
+            .messages
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| item.id)
+            .collect())
+    }
+
+    async fn fetch_message_summary_with_token(
+        &self,
+        client: &HttpClient,
+        access_token: &str,
+        id: &str,
+    ) -> Result<MessageSummary> {
+        let detail = client
+            .get(format!("{GMAIL_API_BASE}/users/me/messages/{id}"))
+            .query(&[
+                ("format", "metadata"),
+                ("metadataHeaders", "From"),
+                ("metadataHeaders", "Subject"),
+                ("metadataHeaders", "Date"),
+            ])
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .with_context(|| format!("failed to fetch Gmail message {id}"))?
+            .error_for_status()
+            .with_context(|| format!("Gmail returned an error for message {id}"))?
+            .json::<GmailMessageResponse>()
+            .await
+            .with_context(|| format!("failed to decode Gmail message {id}"))?;
+
+        Ok(MessageSummary {
+            id: id.to_string(),
+            from: header_value(&detail.payload, "From")
+                .unwrap_or_else(|| "(unknown sender)".to_string()),
+            subject: header_value(&detail.payload, "Subject")
+                .unwrap_or_else(|| "(no subject)".to_string()),
+            received_at: header_value(&detail.payload, "Date")
+                .unwrap_or_else(|| "(unknown date)".to_string()),
+        })
+    }
+}
+
 fn require_token(client: &StubGmailClient) -> Result<StoredToken> {
     client.load_token()?.ok_or_else(|| {
         anyhow!("no OAuth token found; run `mailman auth` before using Gmail commands")
     })
+}
+
+fn is_unauthorized(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .any(|reqwest_error| reqwest_error.status() == Some(reqwest::StatusCode::UNAUTHORIZED))
 }
 
 struct OAuthCallback {

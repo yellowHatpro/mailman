@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod config;
 mod gmail;
+mod ui;
 
 use anyhow::Result;
 use clap::Parser;
