@@ -10,10 +10,10 @@ Right now, these commands work:
 - `init` creates your config file
 - `auth` signs you into Google in the browser
 - `inbox` lists recent inbox messages
+- `read` fetches a full message by Gmail message id
 
 These commands exist but are not fully implemented yet:
 
-- `read`
 - `send`
 
 ## Before You Start
@@ -99,11 +99,14 @@ TUI controls:
 - `k` or Up Arrow moves up
 - `g` jumps to the top
 - `G` jumps to the bottom
+- `n` or Right Arrow loads the next inbox page
+- `p` or Left Arrow loads the previous inbox page
 - `q` or `Esc` quits
+
+The right-side pane shows the full content of the selected message after it loads.
 
 ## Current Limitations
 
-- `read` is not connected to the real Gmail API yet.
 - `send` is not connected to the real Gmail API yet.
 - The app currently focuses on a developer-run local workflow rather than packaged distribution.
 

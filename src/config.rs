@@ -77,6 +77,10 @@ impl AppConfig {
     pub fn token_store_path(&self) -> Result<PathBuf> {
         Ok(Self::data_dir()?.join(&self.gmail.token_store))
     }
+
+    pub fn cache_dir() -> Result<PathBuf> {
+        Ok(Self::data_dir()?.join("cache"))
+    }
 }
 
 pub fn config_file_path() -> Result<PathBuf> {

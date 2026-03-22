@@ -5,7 +5,7 @@
 - a CLI with basic commands
 - config bootstrapping in a predictable app directory
 - browser-based OAuth sign-in with local token storage
-- a Gmail client boundary ready for Gmail API wiring
+- a paginated inbox TUI with full-message viewing for the selected mail
 
 ## Planned tasks
 
@@ -44,13 +44,15 @@ src/
   main.rs
 ```
 
-## Next implementation step
+## Current status
 
-Wire the Gmail client to the real Gmail API:
+Implemented:
 
-1. Create a Google Cloud project.
-2. Enable the Gmail API.
-3. Create OAuth client credentials.
-4. Store client metadata in the config file.
-5. Use `cargo run -- auth` to sign in and save tokens.
-6. Implement Gmail API requests for inbox/read/send in `src/gmail/client.rs`.
+1. Google OAuth desktop sign-in
+2. Inbox listing
+3. Default TUI launch with page navigation
+4. Full message fetch for the selected mail
+
+Remaining major task:
+
+1. Implement Gmail send support

@@ -1,24 +1,30 @@
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
 use oauth2::basic::BasicClient;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
     RefreshToken, Scope, TokenResponse, TokenUrl,
 };
 use reqwest::Client as HttpClient;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use url::Url;
 
 use crate::config::AppConfig;
-use crate::gmail::models::{MessageDetail, MessageSummary, StoredToken};
+use crate::gmail::models::{InboxPage, MessageDetail, MessageSummary, StoredToken};
 
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1";
+const CACHE_TTL_SECS: u64 = 2 * 24 * 60 * 60;
+const CACHE_SCHEMA_VERSION: &str = "v3";
 const GMAIL_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
@@ -53,21 +59,40 @@ impl StubGmailClient {
         Ok(())
     }
 
-    pub async fn list_inbox_ids(&self, limit: usize) -> Result<Vec<String>> {
+    pub async fn fetch_inbox_page(
+        &self,
+        limit: usize,
+        page_token: Option<&str>,
+    ) -> Result<InboxPage> {
         self.ensure_configured()?;
+        if let Some(cached) = self.load_inbox_page_cache(limit, page_token)? {
+            return Ok(cached);
+        }
+
         let capped = limit.min(50);
         let client = self.authorized_http_client().await?;
         let token = require_token(self)?;
 
         match self
-            .fetch_inbox_message_ids(&client, &token.access_token, capped)
+            .fetch_inbox_page_with_token(&client, &token.access_token, capped, page_token)
             .await
         {
-            Ok(ids) => Ok(ids),
+            Ok(page) => {
+                self.save_inbox_page_cache(limit, page_token, &page)?;
+                Ok(page)
+            }
             Err(error) if is_unauthorized(&error) => {
                 let refreshed = self.refresh_access_token(token).await?;
-                self.fetch_inbox_message_ids(&client, &refreshed.access_token, capped)
-                    .await
+                let page = self
+                    .fetch_inbox_page_with_token(
+                        &client,
+                        &refreshed.access_token,
+                        capped,
+                        page_token,
+                    )
+                    .await?;
+                self.save_inbox_page_cache(limit, page_token, &page)?;
+                Ok(page)
             }
             Err(error) => Err(error),
         }
@@ -75,6 +100,10 @@ impl StubGmailClient {
 
     pub async fn fetch_message_summary(&self, id: &str) -> Result<MessageSummary> {
         self.ensure_configured()?;
+        if let Some(cached) = self.load_message_summary_cache(id)? {
+            return Ok(cached);
+        }
+
         let client = self.authorized_http_client().await?;
         let token = require_token(self)?;
 
@@ -82,11 +111,17 @@ impl StubGmailClient {
             .fetch_message_summary_with_token(&client, &token.access_token, id)
             .await
         {
-            Ok(message) => Ok(message),
+            Ok(message) => {
+                self.save_message_summary_cache(id, &message)?;
+                Ok(message)
+            }
             Err(error) if is_unauthorized(&error) => {
                 let refreshed = self.refresh_access_token(token).await?;
-                self.fetch_message_summary_with_token(&client, &refreshed.access_token, id)
-                    .await
+                let message = self
+                    .fetch_message_summary_with_token(&client, &refreshed.access_token, id)
+                    .await?;
+                self.save_message_summary_cache(id, &message)?;
+                Ok(message)
             }
             Err(error) => Err(error),
         }
@@ -191,6 +226,97 @@ impl StubGmailClient {
         self.save_token(&updated)?;
         Ok(updated)
     }
+
+    fn cache_dir(&self) -> Result<PathBuf> {
+        let dir = AppConfig::cache_dir()?;
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create cache directory {}", dir.display()))?;
+        Ok(dir)
+    }
+
+    fn inbox_page_cache_path(&self, limit: usize, page_token: Option<&str>) -> Result<PathBuf> {
+        let suffix = page_token
+            .map(stable_hash)
+            .unwrap_or_else(|| "first".to_string());
+        Ok(self.cache_dir()?.join(format!(
+            "{CACHE_SCHEMA_VERSION}_inbox_page_limit_{limit}_{suffix}.json"
+        )))
+    }
+
+    fn message_summary_cache_path(&self, id: &str) -> Result<PathBuf> {
+        Ok(self.cache_dir()?.join(format!(
+            "{CACHE_SCHEMA_VERSION}_message_summary_{}.json",
+            sanitize_filename(id)
+        )))
+    }
+
+    fn message_detail_cache_path(&self, id: &str) -> Result<PathBuf> {
+        Ok(self.cache_dir()?.join(format!(
+            "{CACHE_SCHEMA_VERSION}_message_detail_{}.json",
+            sanitize_filename(id)
+        )))
+    }
+
+    fn load_inbox_page_cache(
+        &self,
+        limit: usize,
+        page_token: Option<&str>,
+    ) -> Result<Option<InboxPage>> {
+        self.load_cached_value(&self.inbox_page_cache_path(limit, page_token)?)
+    }
+
+    fn save_inbox_page_cache(
+        &self,
+        limit: usize,
+        page_token: Option<&str>,
+        page: &InboxPage,
+    ) -> Result<()> {
+        self.save_cached_value(&self.inbox_page_cache_path(limit, page_token)?, page)
+    }
+
+    fn load_message_summary_cache(&self, id: &str) -> Result<Option<MessageSummary>> {
+        self.load_cached_value(&self.message_summary_cache_path(id)?)
+    }
+
+    fn save_message_summary_cache(&self, id: &str, value: &MessageSummary) -> Result<()> {
+        self.save_cached_value(&self.message_summary_cache_path(id)?, value)
+    }
+
+    fn load_message_detail_cache(&self, id: &str) -> Result<Option<MessageDetail>> {
+        self.load_cached_value(&self.message_detail_cache_path(id)?)
+    }
+
+    fn save_message_detail_cache(&self, id: &str, value: &MessageDetail) -> Result<()> {
+        self.save_cached_value(&self.message_detail_cache_path(id)?, value)
+    }
+
+    fn load_cached_value<T: DeserializeOwned>(&self, path: &Path) -> Result<Option<T>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read cache file {}", path.display()))?;
+        let envelope: CacheEnvelope<T> = serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse cache file {}", path.display()))?;
+
+        if cache_is_fresh(envelope.cached_at_epoch_secs) {
+            Ok(Some(envelope.value))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn save_cached_value<T: Serialize>(&self, path: &Path, value: &T) -> Result<()> {
+        let envelope = CacheEnvelope {
+            cached_at_epoch_secs: now_epoch_secs()?,
+            value,
+        };
+        let raw = serde_json::to_string(&envelope).context("failed to serialize cache entry")?;
+        fs::write(path, raw)
+            .with_context(|| format!("failed to write cache file {}", path.display()))?;
+        Ok(())
+    }
 }
 
 impl GmailClient for StubGmailClient {
@@ -292,17 +418,31 @@ impl GmailClient for StubGmailClient {
 
     async fn read_message(&self, id: &str) -> Result<MessageDetail> {
         self.ensure_configured()?;
-        require_token(self)?;
+        if let Some(cached) = self.load_message_detail_cache(id)? {
+            return Ok(cached);
+        }
 
-        Ok(MessageDetail {
-            id: id.to_string(),
-            from: "demo.sender@gmail.com".to_string(),
-            to: vec![self.config.gmail.account_email.clone()],
-            subject: format!("Opened {}", id),
-            body: "This is stub message content. Replace the stub client with Gmail API calls."
-                .to_string(),
-            received_at: "2026-03-22T09:00:00Z".to_string(),
-        })
+        let client = self.authorized_http_client().await?;
+        let token = require_token(self)?;
+
+        match self
+            .fetch_message_detail_with_token(&client, &token.access_token, id)
+            .await
+        {
+            Ok(message) => {
+                self.save_message_detail_cache(id, &message)?;
+                Ok(message)
+            }
+            Err(error) if is_unauthorized(&error) => {
+                let refreshed = self.refresh_access_token(token).await?;
+                let message = self
+                    .fetch_message_detail_with_token(&client, &refreshed.access_token, id)
+                    .await?;
+                self.save_message_detail_cache(id, &message)?;
+                Ok(message)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn send_message(&self, to: &[String], subject: &str, body: &str) -> Result<()> {
@@ -331,10 +471,10 @@ impl StubGmailClient {
         limit: usize,
     ) -> Result<Vec<MessageSummary>> {
         let message_ids = self
-            .fetch_inbox_message_ids(client, access_token, limit)
+            .fetch_inbox_page_with_token(client, access_token, limit, None)
             .await?;
         let mut messages = Vec::new();
-        for id in message_ids {
+        for id in message_ids.ids {
             messages.push(
                 self.fetch_message_summary_with_token(client, access_token, &id)
                     .await?,
@@ -344,17 +484,22 @@ impl StubGmailClient {
         Ok(messages)
     }
 
-    async fn fetch_inbox_message_ids(
+    async fn fetch_inbox_page_with_token(
         &self,
         client: &HttpClient,
         access_token: &str,
         limit: usize,
-    ) -> Result<Vec<String>> {
+        page_token: Option<&str>,
+    ) -> Result<InboxPage> {
         let max_results = limit.to_string();
-
-        let list_response = client
+        let mut request = client
             .get(format!("{GMAIL_API_BASE}/users/me/messages"))
-            .query(&[("labelIds", "INBOX"), ("maxResults", max_results.as_str())])
+            .query(&[("labelIds", "INBOX"), ("maxResults", max_results.as_str())]);
+        if let Some(token) = page_token {
+            request = request.query(&[("pageToken", token)]);
+        }
+
+        let list_response = request
             .bearer_auth(access_token)
             .send()
             .await
@@ -365,12 +510,15 @@ impl StubGmailClient {
             .await
             .context("failed to decode Gmail inbox response")?;
 
-        Ok(list_response
-            .messages
-            .unwrap_or_default()
-            .into_iter()
-            .map(|item| item.id)
-            .collect())
+        Ok(InboxPage {
+            ids: list_response
+                .messages
+                .unwrap_or_default()
+                .into_iter()
+                .map(|item| item.id)
+                .collect(),
+            next_page_token: list_response.next_page_token,
+        })
     }
 
     async fn fetch_message_summary_with_token(
@@ -405,6 +553,45 @@ impl StubGmailClient {
                 .unwrap_or_else(|| "(no subject)".to_string()),
             received_at: header_value(&detail.payload, "Date")
                 .unwrap_or_else(|| "(unknown date)".to_string()),
+            category: classify_message(&detail.label_ids, detail.snippet.as_deref()),
+        })
+    }
+
+    async fn fetch_message_detail_with_token(
+        &self,
+        client: &HttpClient,
+        access_token: &str,
+        id: &str,
+    ) -> Result<MessageDetail> {
+        let message = client
+            .get(format!("{GMAIL_API_BASE}/users/me/messages/{id}"))
+            .query(&[("format", "full")])
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .with_context(|| format!("failed to fetch Gmail message body for {id}"))?
+            .error_for_status()
+            .with_context(|| format!("Gmail returned an error for message {id}"))?
+            .json::<GmailMessageResponse>()
+            .await
+            .with_context(|| format!("failed to decode Gmail message body for {id}"))?;
+
+        let payload = message.payload;
+        let body = payload
+            .as_ref()
+            .and_then(extract_best_body)
+            .map(format_message_body)
+            .unwrap_or_else(|| "(no message body found)".to_string());
+
+        Ok(MessageDetail {
+            id: id.to_string(),
+            from: header_value(&payload, "From").unwrap_or_else(|| "(unknown sender)".to_string()),
+            to: header_list(&payload, "To"),
+            subject: header_value(&payload, "Subject")
+                .unwrap_or_else(|| "(no subject)".to_string()),
+            received_at: header_value(&payload, "Date")
+                .unwrap_or_else(|| "(unknown date)".to_string()),
+            body,
         })
     }
 }
@@ -501,6 +688,8 @@ async fn wait_for_callback(addr: SocketAddr) -> Result<OAuthCallback> {
 #[derive(Debug, Deserialize)]
 struct ListMessagesResponse {
     messages: Option<Vec<GmailMessageListItem>>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -510,18 +699,36 @@ struct GmailMessageListItem {
 
 #[derive(Debug, Deserialize)]
 struct GmailMessageResponse {
+    #[serde(rename = "labelIds")]
+    label_ids: Option<Vec<String>>,
+    snippet: Option<String>,
     payload: Option<GmailMessagePayload>,
 }
 
 #[derive(Debug, Deserialize)]
 struct GmailMessagePayload {
+    #[serde(rename = "mimeType")]
+    mime_type: Option<String>,
     headers: Option<Vec<GmailHeader>>,
+    body: Option<GmailBody>,
+    parts: Option<Vec<GmailMessagePayload>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GmailBody {
+    data: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct GmailHeader {
     name: String,
     value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CacheEnvelope<T> {
+    cached_at_epoch_secs: u64,
+    value: T,
 }
 
 fn header_value(payload: &Option<GmailMessagePayload>, key: &str) -> Option<String> {
@@ -534,4 +741,306 @@ fn header_value(payload: &Option<GmailMessagePayload>, key: &str) -> Option<Stri
                 .find(|header| header.name.eq_ignore_ascii_case(key))
         })
         .map(|header| header.value.clone())
+}
+
+fn header_list(payload: &Option<GmailMessagePayload>, key: &str) -> Vec<String> {
+    header_value(payload, key)
+        .map(|value| {
+            value
+                .split(',')
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+enum ExtractedBody {
+    Plain(String),
+    Html(String),
+}
+
+fn extract_best_body(payload: &GmailMessagePayload) -> Option<ExtractedBody> {
+    if let Some(text) = extract_plain_body(payload) {
+        if looks_like_html(&text) {
+            return Some(ExtractedBody::Html(text));
+        }
+        return Some(ExtractedBody::Plain(text));
+    }
+
+    extract_html_body(payload).map(ExtractedBody::Html)
+}
+
+fn extract_plain_body(payload: &GmailMessagePayload) -> Option<String> {
+    if payload.mime_type.as_deref() == Some("text/plain") {
+        if let Some(text) = decode_body_data(payload.body.as_ref()) {
+            return Some(text);
+        }
+    }
+
+    payload
+        .parts
+        .as_ref()
+        .and_then(|parts| parts.iter().find_map(extract_plain_body))
+}
+
+fn extract_html_body(payload: &GmailMessagePayload) -> Option<String> {
+    if payload.mime_type.as_deref() == Some("text/html") {
+        if let Some(text) = decode_body_data(payload.body.as_ref()) {
+            return Some(text);
+        }
+    }
+
+    payload
+        .parts
+        .as_ref()
+        .and_then(|parts| parts.iter().find_map(extract_html_body))
+        .or_else(|| decode_body_data(payload.body.as_ref()))
+}
+
+fn decode_body_data(body: Option<&GmailBody>) -> Option<String> {
+    let data = body?.data.as_ref()?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(data)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(data))
+        .ok()?;
+    String::from_utf8(decoded).ok()
+}
+
+fn looks_like_html(text: &str) -> bool {
+    let lower = text.trim_start().to_ascii_lowercase();
+    lower.starts_with("<!doctype html")
+        || lower.starts_with("<html")
+        || lower.starts_with("<body")
+        || lower.contains("<head")
+        || lower.contains("<table")
+        || lower.contains("<div")
+        || lower.contains("<span")
+        || lower.contains("<a href=")
+        || lower.contains("</p>")
+}
+
+fn format_message_body(body: ExtractedBody) -> String {
+    let normalized = match body {
+        ExtractedBody::Plain(text) => text.replace("\r\n", "\n").replace('\r', "\n"),
+        ExtractedBody::Html(html) => {
+            html2text::from_read(remove_html_sections(&html).as_bytes(), 80)
+                .unwrap_or(html)
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+        }
+    };
+
+    let cleaned = shorten_urls(&decode_html_entities(&normalized));
+    let wrapped = cleaned
+        .lines()
+        .map(|line| wrap_text_line(&normalize_whitespace(line), 72))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    collapse_blank_lines(&wrapped)
+}
+
+fn remove_html_sections(input: &str) -> String {
+    let mut output = input.to_string();
+    for tag in ["script", "style", "head", "title"] {
+        output = remove_tag_block(&output, tag);
+    }
+    output
+}
+
+fn remove_tag_block(input: &str, tag: &str) -> String {
+    let mut result = String::new();
+    let mut rest = input;
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+
+    loop {
+        let Some(start) = rest.to_ascii_lowercase().find(&open) else {
+            result.push_str(rest);
+            break;
+        };
+        result.push_str(&rest[..start]);
+        let after_start = &rest[start..];
+        let lower_after = after_start.to_ascii_lowercase();
+        let Some(end) = lower_after.find(&close) else {
+            break;
+        };
+        let close_end = end + close.len();
+        rest = &after_start[close_end..];
+    }
+
+    result
+}
+
+fn decode_html_entities(input: &str) -> String {
+    input
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+fn shorten_urls(input: &str) -> String {
+    input
+        .split_whitespace()
+        .map(|token| {
+            if (token.starts_with("http://") || token.starts_with("https://")) && token.len() > 60 {
+                "[link]".to_string()
+            } else {
+                token.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_whitespace(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn wrap_text_line(line: &str, max_width: usize) -> String {
+    if line.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    let mut current_len = 0usize;
+
+    for word in line.split_whitespace() {
+        let word_len = word.chars().count();
+        if current_len == 0 {
+            if word_len <= max_width {
+                out.push_str(word);
+                current_len = word_len;
+            } else {
+                out.push_str(&hard_wrap_word(word, max_width));
+                current_len = out
+                    .lines()
+                    .last()
+                    .map(|line| line.chars().count())
+                    .unwrap_or(0);
+            }
+            continue;
+        }
+
+        if current_len + 1 + word_len <= max_width {
+            out.push(' ');
+            out.push_str(word);
+            current_len += 1 + word_len;
+        } else {
+            out.push('\n');
+            if word_len <= max_width {
+                out.push_str(word);
+                current_len = word_len;
+            } else {
+                out.push_str(&hard_wrap_word(word, max_width));
+                current_len = out
+                    .lines()
+                    .last()
+                    .map(|line| line.chars().count())
+                    .unwrap_or(0);
+            }
+        }
+    }
+
+    out
+}
+
+fn hard_wrap_word(word: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    let mut count = 0usize;
+    for ch in word.chars() {
+        if count == max_width {
+            out.push('\n');
+            count = 0;
+        }
+        out.push(ch);
+        count += 1;
+    }
+    out
+}
+
+fn collapse_blank_lines(input: &str) -> String {
+    let mut output = String::new();
+    let mut blank_count = 0usize;
+
+    for line in input.lines() {
+        if line.trim().is_empty() {
+            blank_count += 1;
+            if blank_count > 1 {
+                continue;
+            }
+        } else {
+            blank_count = 0;
+        }
+
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(line.trim_end());
+    }
+
+    output
+}
+
+fn now_epoch_secs() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX epoch")?
+        .as_secs())
+}
+
+fn cache_is_fresh(cached_at_epoch_secs: u64) -> bool {
+    now_epoch_secs()
+        .map(|now| now.saturating_sub(cached_at_epoch_secs) <= CACHE_TTL_SECS)
+        .unwrap_or(false)
+}
+
+fn sanitize_filename(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn stable_hash(input: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    input.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
+fn classify_message(label_ids: &Option<Vec<String>>, snippet: Option<&str>) -> String {
+    if let Some(labels) = label_ids {
+        if labels.iter().any(|label| label == "CATEGORY_PROMOTIONS") {
+            return "Promotions".to_string();
+        }
+        if labels.iter().any(|label| label == "CATEGORY_SOCIAL") {
+            return "Social".to_string();
+        }
+        if labels.iter().any(|label| label == "CATEGORY_UPDATES") {
+            return "Updates".to_string();
+        }
+        if labels.iter().any(|label| label == "CATEGORY_FORUMS") {
+            return "Forums".to_string();
+        }
+        if labels.iter().any(|label| label == "CATEGORY_PERSONAL") {
+            return "Primary".to_string();
+        }
+    }
+
+    let lowered = snippet.unwrap_or_default().to_ascii_lowercase();
+    if lowered.contains("unsubscribe") || lowered.contains("newsletter") {
+        "Promotion".to_string()
+    } else {
+        "Primary".to_string()
+    }
 }
