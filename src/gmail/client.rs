@@ -19,14 +19,16 @@ use url::Url;
 
 use crate::config::AppConfig;
 use crate::gmail::models::{InboxPage, MessageDetail, MessageSummary, StoredToken};
+use crate::ui::inbox::FilterMode;
 
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1";
 const CACHE_TTL_SECS: u64 = 2 * 24 * 60 * 60;
-const CACHE_SCHEMA_VERSION: &str = "v3";
+const CACHE_SCHEMA_VERSION: &str = "v4";
 const GMAIL_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/gmail.send",
 ];
 
@@ -63,9 +65,10 @@ impl StubGmailClient {
         &self,
         limit: usize,
         page_token: Option<&str>,
+        filter: FilterMode,
     ) -> Result<InboxPage> {
         self.ensure_configured()?;
-        if let Some(cached) = self.load_inbox_page_cache(limit, page_token)? {
+        if let Some(cached) = self.load_inbox_page_cache(limit, page_token, filter)? {
             return Ok(cached);
         }
 
@@ -74,11 +77,11 @@ impl StubGmailClient {
         let token = require_token(self)?;
 
         match self
-            .fetch_inbox_page_with_token(&client, &token.access_token, capped, page_token)
+            .fetch_inbox_page_with_token(&client, &token.access_token, capped, page_token, filter)
             .await
         {
             Ok(page) => {
-                self.save_inbox_page_cache(limit, page_token, &page)?;
+                self.save_inbox_page_cache(limit, page_token, filter, &page)?;
                 Ok(page)
             }
             Err(error) if is_unauthorized(&error) => {
@@ -89,9 +92,10 @@ impl StubGmailClient {
                         &refreshed.access_token,
                         capped,
                         page_token,
+                        filter,
                     )
                     .await?;
-                self.save_inbox_page_cache(limit, page_token, &page)?;
+                self.save_inbox_page_cache(limit, page_token, filter, &page)?;
                 Ok(page)
             }
             Err(error) => Err(error),
@@ -122,6 +126,77 @@ impl StubGmailClient {
                     .await?;
                 self.save_message_summary_cache(id, &message)?;
                 Ok(message)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn list_user_labels(&self) -> Result<Vec<GmailLabelInfo>> {
+        self.ensure_configured()?;
+        let client = self.authorized_http_client().await?;
+        let token = require_token(self)?;
+
+        match self
+            .fetch_labels_with_token(&client, &token.access_token)
+            .await
+        {
+            Ok(labels) => Ok(labels),
+            Err(error) if is_unauthorized(&error) => {
+                let refreshed = self.refresh_access_token(token).await?;
+                self.fetch_labels_with_token(&client, &refreshed.access_token)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn apply_or_create_label(
+        &self,
+        message_id: &str,
+        label_name: &str,
+    ) -> Result<MessageSummary> {
+        self.ensure_configured()?;
+        let client = self.authorized_http_client().await?;
+        let token = require_token(self)?;
+
+        match self
+            .apply_or_create_label_with_token(&client, &token.access_token, message_id, label_name)
+            .await
+        {
+            Ok(summary) => Ok(summary),
+            Err(error) if is_unauthorized(&error) => {
+                let refreshed = self.refresh_access_token(token).await?;
+                self.apply_or_create_label_with_token(
+                    &client,
+                    &refreshed.access_token,
+                    message_id,
+                    label_name,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn remove_label(&self, message_id: &str, label_name: &str) -> Result<MessageSummary> {
+        self.ensure_configured()?;
+        let client = self.authorized_http_client().await?;
+        let token = require_token(self)?;
+
+        match self
+            .remove_label_with_token(&client, &token.access_token, message_id, label_name)
+            .await
+        {
+            Ok(summary) => Ok(summary),
+            Err(error) if is_unauthorized(&error) => {
+                let refreshed = self.refresh_access_token(token).await?;
+                self.remove_label_with_token(
+                    &client,
+                    &refreshed.access_token,
+                    message_id,
+                    label_name,
+                )
+                .await
             }
             Err(error) => Err(error),
         }
@@ -234,12 +309,18 @@ impl StubGmailClient {
         Ok(dir)
     }
 
-    fn inbox_page_cache_path(&self, limit: usize, page_token: Option<&str>) -> Result<PathBuf> {
+    fn inbox_page_cache_path(
+        &self,
+        limit: usize,
+        page_token: Option<&str>,
+        filter: FilterMode,
+    ) -> Result<PathBuf> {
         let suffix = page_token
             .map(stable_hash)
             .unwrap_or_else(|| "first".to_string());
         Ok(self.cache_dir()?.join(format!(
-            "{CACHE_SCHEMA_VERSION}_inbox_page_limit_{limit}_{suffix}.json"
+            "{CACHE_SCHEMA_VERSION}_inbox_page_{}_limit_{limit}_{suffix}.json",
+            filter.label()
         )))
     }
 
@@ -261,17 +342,22 @@ impl StubGmailClient {
         &self,
         limit: usize,
         page_token: Option<&str>,
+        filter: FilterMode,
     ) -> Result<Option<InboxPage>> {
-        self.load_cached_value(&self.inbox_page_cache_path(limit, page_token)?)
+        self.load_cached_value(&self.inbox_page_cache_path(limit, page_token, filter)?)
     }
 
     fn save_inbox_page_cache(
         &self,
         limit: usize,
         page_token: Option<&str>,
+        filter: FilterMode,
         page: &InboxPage,
     ) -> Result<()> {
-        self.save_cached_value(&self.inbox_page_cache_path(limit, page_token)?, page)
+        self.save_cached_value(
+            &self.inbox_page_cache_path(limit, page_token, filter)?,
+            page,
+        )
     }
 
     fn load_message_summary_cache(&self, id: &str) -> Result<Option<MessageSummary>> {
@@ -471,7 +557,7 @@ impl StubGmailClient {
         limit: usize,
     ) -> Result<Vec<MessageSummary>> {
         let message_ids = self
-            .fetch_inbox_page_with_token(client, access_token, limit, None)
+            .fetch_inbox_page_with_token(client, access_token, limit, None, FilterMode::All)
             .await?;
         let mut messages = Vec::new();
         for id in message_ids.ids {
@@ -490,11 +576,15 @@ impl StubGmailClient {
         access_token: &str,
         limit: usize,
         page_token: Option<&str>,
+        filter: FilterMode,
     ) -> Result<InboxPage> {
         let max_results = limit.to_string();
         let mut request = client
             .get(format!("{GMAIL_API_BASE}/users/me/messages"))
-            .query(&[("labelIds", "INBOX"), ("maxResults", max_results.as_str())]);
+            .query(&[("maxResults", max_results.as_str())]);
+        for label in gmail_labels_for_filter(filter) {
+            request = request.query(&[("labelIds", label)]);
+        }
         if let Some(token) = page_token {
             request = request.query(&[("pageToken", token)]);
         }
@@ -554,6 +644,10 @@ impl StubGmailClient {
             received_at: header_value(&detail.payload, "Date")
                 .unwrap_or_else(|| "(unknown date)".to_string()),
             category: classify_message(&detail.label_ids, detail.snippet.as_deref()),
+            labels: detail.label_ids.unwrap_or_default(),
+            snippet: detail.snippet.unwrap_or_default(),
+            provider: "gmail".to_string(),
+            account: self.config.gmail.account_email.clone(),
         })
     }
 
@@ -593,6 +687,117 @@ impl StubGmailClient {
                 .unwrap_or_else(|| "(unknown date)".to_string()),
             body,
         })
+    }
+
+    async fn fetch_labels_with_token(
+        &self,
+        client: &HttpClient,
+        access_token: &str,
+    ) -> Result<Vec<GmailLabelInfo>> {
+        let response = client
+            .get(format!("{GMAIL_API_BASE}/users/me/labels"))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .context("failed to fetch Gmail labels")?
+            .error_for_status()
+            .context("Gmail labels query failed")?
+            .json::<LabelsListResponse>()
+            .await
+            .context("failed to decode Gmail labels response")?;
+
+        Ok(response
+            .labels
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|label| label.label_type.as_deref() == Some("user"))
+            .collect())
+    }
+
+    async fn apply_or_create_label_with_token(
+        &self,
+        client: &HttpClient,
+        access_token: &str,
+        message_id: &str,
+        label_name: &str,
+    ) -> Result<MessageSummary> {
+        let labels = self.fetch_labels_with_token(client, access_token).await?;
+        let label = if let Some(found) = labels.into_iter().find(|label| label.name == label_name) {
+            found
+        } else {
+            client
+                .post(format!("{GMAIL_API_BASE}/users/me/labels"))
+                .bearer_auth(access_token)
+                .json(&CreateLabelRequest {
+                    name: label_name.to_string(),
+                    label_list_visibility: "labelShow".to_string(),
+                    message_list_visibility: "show".to_string(),
+                })
+                .send()
+                .await
+                .context("failed to create Gmail label")?
+                .error_for_status()
+                .context("Gmail label creation failed")?
+                .json::<GmailLabelInfo>()
+                .await
+                .context("failed to decode Gmail label creation response")?
+        };
+
+        client
+            .post(format!(
+                "{GMAIL_API_BASE}/users/me/messages/{message_id}/modify"
+            ))
+            .bearer_auth(access_token)
+            .json(&ModifyLabelsRequest {
+                add_label_ids: vec![label.id.clone()],
+                remove_label_ids: Vec::new(),
+            })
+            .send()
+            .await
+            .with_context(|| format!("failed to apply label '{label_name}'"))?
+            .error_for_status()
+            .with_context(|| format!("Gmail failed to apply label '{label_name}'"))?;
+
+        let summary = self
+            .fetch_message_summary_with_token(client, access_token, message_id)
+            .await?;
+        self.save_message_summary_cache(message_id, &summary)?;
+        Ok(summary)
+    }
+
+    async fn remove_label_with_token(
+        &self,
+        client: &HttpClient,
+        access_token: &str,
+        message_id: &str,
+        label_name: &str,
+    ) -> Result<MessageSummary> {
+        let labels = self.fetch_labels_with_token(client, access_token).await?;
+        let label = labels
+            .into_iter()
+            .find(|label| label.name == label_name)
+            .ok_or_else(|| anyhow!("label '{label_name}' does not exist"))?;
+
+        client
+            .post(format!(
+                "{GMAIL_API_BASE}/users/me/messages/{message_id}/modify"
+            ))
+            .bearer_auth(access_token)
+            .json(&ModifyLabelsRequest {
+                add_label_ids: Vec::new(),
+                remove_label_ids: vec![label.id.clone()],
+            })
+            .send()
+            .await
+            .with_context(|| format!("failed to remove label '{label_name}'"))?
+            .error_for_status()
+            .with_context(|| format!("Gmail failed to remove label '{label_name}'"))?;
+
+        let summary = self
+            .fetch_message_summary_with_token(client, access_token, message_id)
+            .await?;
+        self.save_message_summary_cache(message_id, &summary)?;
+        Ok(summary)
     }
 }
 
@@ -703,6 +908,36 @@ struct GmailMessageResponse {
     label_ids: Option<Vec<String>>,
     snippet: Option<String>,
     payload: Option<GmailMessagePayload>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct GmailLabelInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    label_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LabelsListResponse {
+    labels: Option<Vec<GmailLabelInfo>>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateLabelRequest {
+    name: String,
+    #[serde(rename = "labelListVisibility")]
+    label_list_visibility: String,
+    #[serde(rename = "messageListVisibility")]
+    message_list_visibility: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ModifyLabelsRequest {
+    #[serde(rename = "addLabelIds")]
+    add_label_ids: Vec<String>,
+    #[serde(rename = "removeLabelIds")]
+    remove_label_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1042,5 +1277,19 @@ fn classify_message(label_ids: &Option<Vec<String>>, snippet: Option<&str>) -> S
         "Promotion".to_string()
     } else {
         "Primary".to_string()
+    }
+}
+
+fn gmail_labels_for_filter(filter: FilterMode) -> &'static [&'static str] {
+    match filter {
+        FilterMode::All => &["INBOX"],
+        FilterMode::Primary => &["INBOX", "CATEGORY_PERSONAL"],
+        FilterMode::Promotions => &["INBOX", "CATEGORY_PROMOTIONS"],
+        FilterMode::Updates => &["INBOX", "CATEGORY_UPDATES"],
+        FilterMode::Social => &["INBOX", "CATEGORY_SOCIAL"],
+        FilterMode::Forums => &["INBOX", "CATEGORY_FORUMS"],
+        FilterMode::Important => &["INBOX", "IMPORTANT"],
+        FilterMode::Spam => &["SPAM"],
+        FilterMode::Unread => &["INBOX", "UNREAD"],
     }
 }

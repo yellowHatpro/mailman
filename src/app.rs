@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 use crate::cli::{Cli, Commands};
 use crate::config::AppConfig;
 use crate::gmail::client::{GmailClient, StubGmailClient};
-use crate::ui::inbox::{InboxCommand, InboxEvent, InboxTui};
+use crate::ui::inbox::{FilterMode, InboxCommand, InboxEvent, InboxTui};
 
 pub async fn run(cli: Cli) -> Result<()> {
     if cli.command.is_none() {
@@ -18,6 +18,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             let mut page_start_tokens = vec![None::<String>];
             let mut current_page = 0usize;
             let mut next_page_token = None::<String>;
+            let mut active_filter = FilterMode::All;
 
             while let Some(command) = command_rx.recv().await {
                 match command {
@@ -25,6 +26,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                         current_page = 0;
                         page_start_tokens = vec![None];
                         next_page_token = None;
+                        if let Ok(labels) = client.list_user_labels().await {
+                            let _ = event_tx.send(InboxEvent::LabelsLoaded(
+                                labels
+                                    .into_iter()
+                                    .map(|label| (label.id, label.name))
+                                    .collect(),
+                            ));
+                        }
                         let page_token = page_start_tokens[current_page].clone();
                         if load_page(
                             &client,
@@ -32,6 +41,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                             limit,
                             current_page,
                             page_token.as_deref(),
+                            active_filter,
                             true,
                             &mut next_page_token,
                             &mut page_start_tokens,
@@ -57,6 +67,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                             limit,
                             current_page,
                             page_token.as_deref(),
+                            active_filter,
                             false,
                             &mut next_page_token,
                             &mut page_start_tokens,
@@ -78,6 +89,66 @@ pub async fn run(cli: Cli) -> Result<()> {
                             }
                         }
                     }
+                    InboxCommand::ApplyFilter(filter) => {
+                        active_filter = filter;
+                        current_page = 0;
+                        page_start_tokens = vec![None];
+                        next_page_token = None;
+                        if load_page(
+                            &client,
+                            &event_tx,
+                            limit,
+                            current_page,
+                            None,
+                            active_filter,
+                            true,
+                            &mut next_page_token,
+                            &mut page_start_tokens,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    InboxCommand::CreateOrApplyLabel {
+                        message_id,
+                        label_name,
+                    } => match client.apply_or_create_label(&message_id, &label_name).await {
+                        Ok(summary) => {
+                            if let Ok(labels) = client.list_user_labels().await {
+                                let _ = event_tx.send(InboxEvent::LabelsLoaded(
+                                    labels
+                                        .into_iter()
+                                        .map(|label| (label.id, label.name))
+                                        .collect(),
+                                ));
+                            }
+                            let _ = event_tx.send(InboxEvent::MessageUpdated(summary));
+                            let _ = event_tx.send(InboxEvent::Status(format!(
+                                "Applied label '{}'",
+                                label_name
+                            )));
+                        }
+                        Err(error) => {
+                            let _ = event_tx.send(InboxEvent::Error(error.to_string()));
+                        }
+                    },
+                    InboxCommand::RemoveLabel {
+                        message_id,
+                        label_name,
+                    } => match client.remove_label(&message_id, &label_name).await {
+                        Ok(summary) => {
+                            let _ = event_tx.send(InboxEvent::MessageUpdated(summary));
+                            let _ = event_tx.send(InboxEvent::Status(format!(
+                                "Removed label '{}'",
+                                label_name
+                            )));
+                        }
+                        Err(error) => {
+                            let _ = event_tx.send(InboxEvent::Error(error.to_string()));
+                        }
+                    },
                 }
             }
         });
@@ -143,6 +214,7 @@ async fn load_page(
     limit: usize,
     page_index: usize,
     page_token: Option<&str>,
+    filter: FilterMode,
     replace: bool,
     next_page_token: &mut Option<String>,
     page_start_tokens: &mut Vec<Option<String>>,
@@ -151,7 +223,7 @@ async fn load_page(
         page_index,
         replace,
     });
-    let page = client.fetch_inbox_page(limit, page_token).await?;
+    let page = client.fetch_inbox_page(limit, page_token, filter).await?;
     for id in &page.ids {
         let message = client.fetch_message_summary(id).await?;
         let _ = event_tx.send(InboxEvent::PageMessageLoaded {

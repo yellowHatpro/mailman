@@ -97,13 +97,36 @@ TUI controls:
 
 - `j` or Down Arrow moves down
 - `k` or Up Arrow moves up
-- `g` jumps to the top
-- `G` jumps to the bottom
-- `n` or Right Arrow loads the next inbox page
-- `p` or Left Arrow loads the previous inbox page
+- `Enter` or `n` loads more messages when the load-more row is selected
+- `/` enters local search mode
+- `f` cycles the inbox filter
+- `g` cycles grouping mode
+- `r` resets filter, grouping, and search
+- `PgUp` and `PgDn` scroll the message body
+- `Home` jumps to the top
+- `End` jumps to the bottom
 - `q` or `Esc` quits
 
 The right-side pane shows the full content of the selected message after it loads.
+
+Current local filters include:
+
+- all
+- primary
+- promotions
+- updates
+- social
+- forums
+- important
+- spam
+- unread
+
+Current grouping modes include:
+
+- none
+- category
+- date
+- provider
 
 ## Current Limitations
 

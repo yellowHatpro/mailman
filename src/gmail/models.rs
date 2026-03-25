@@ -5,6 +5,10 @@ pub struct MessageSummary {
     pub subject: String,
     pub received_at: String,
     pub category: String,
+    pub labels: Vec<String>,
+    pub snippet: String,
+    pub provider: String,
+    pub account: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

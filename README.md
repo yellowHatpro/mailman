@@ -5,7 +5,7 @@
 - a CLI with basic commands
 - config bootstrapping in a predictable app directory
 - browser-based OAuth sign-in with local token storage
-- a paginated inbox TUI with full-message viewing for the selected mail
+- a paginated inbox TUI with local filter/search/grouping and full-message viewing
 
 ## Planned tasks
 
@@ -52,6 +52,7 @@ Implemented:
 2. Inbox listing
 3. Default TUI launch with page navigation
 4. Full message fetch for the selected mail
+5. Local filter, search, and grouping in the inbox TUI
 
 Remaining major task:
 
